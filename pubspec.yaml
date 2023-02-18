@@ -1,10 +1,10 @@
 name: drago_usb_printer
 description: This plugin will allow develop send data and work with usb printer on android
-version: 0.0.1
+version: 0.0.2
 homepage: https://github.com/selvam920/drago_usb_printer
 
 environment:
-  sdk: '>=2.12.0 <3.0.0'
+  sdk: '>=2.19.2 <3.0.0'
   flutter: ">=1.20.0"
 
 dependencies:
