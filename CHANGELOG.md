@@ -9,3 +9,7 @@
 ## 0.0.4
 
 * Fix kotlin version
+
+## 0.0.5
+
+* Flutter 3.10
