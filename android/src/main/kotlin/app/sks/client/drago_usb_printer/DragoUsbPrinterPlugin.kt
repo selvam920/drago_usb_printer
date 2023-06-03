@@ -1,145 +1,238 @@
 package app.sks.client.drago_usb_printer
 
-import android.app.Activity
-import android.content.Context
-import android.os.Build
-import androidx.annotation.NonNull
-import app.sks.client.drago_usb_printer.adapter.USBPrinterAdapter
+import android.hardware.usb.UsbDevice
+import android.util.Base64
+import app.sks.client.drago_usb_printer.tools.MessageSender
+import app.sks.client.drago_usb_printer.tools.MethodCallParser
+import app.sks.client.drago_usb_printer.tools.OnUsbListener
+import app.sks.client.drago_usb_printer.tools.UsbDeviceHelper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.embedding.engine.plugins.activity.ActivityAware
-import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
-
-
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.nio.charset.Charset
 
 /** DragoUsbPrinterPlugin */
-class DragoUsbPrinterPlugin: FlutterPlugin, MethodCallHandler, ActivityAware {
-  private var adapter: USBPrinterAdapter? = null
-  /// The MethodChannel that will the communication between Flutter and native Android
-  ///
-  /// This local reference serves to register the plugin with the Flutter Engine and unregister it
-  /// when the Flutter Engine is detached from the Activity
-  private lateinit var channel : MethodChannel
-  private lateinit var activity: Activity
-  private lateinit var context: Context
+class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
+  private lateinit var binaryMessenger: BinaryMessenger
+  private lateinit var channel: MethodChannel
+  private lateinit var eventChannel: EventChannel
 
-  override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
-    channel = MethodChannel(flutterPluginBinding.binaryMessenger, "drago_usb_printer")
+  private lateinit var usbConnCache: HashMap<String, UsbConn>
+
+  private val usbBroadListener = object : OnUsbListener {
+    override fun onDeviceAttached(usbDevice: UsbDevice?) {
+      //Usb设备插入
+      usbDevice?.let {
+        UsbDeviceHelper.instance.checkPermission(it)?.let { hasPermission ->
+          if (hasPermission) {
+            MessageSender.sendUsbPlugStatus(usbDevice, 1)
+          }
+        }
+      }
+    }
+
+    override fun onDeviceDetached(usbDevice: UsbDevice?) {
+      //Usb设备拔出
+      usbDevice?.let {
+        val deviceId = "${it.vendorId} - ${it.productId} - "
+        removeConnCacheWithKey(deviceId)
+        MessageSender.sendUsbPlugStatus(usbDevice, 0)
+      }
+    }
+
+    override fun onDeviceGranted(usbDevice: UsbDevice, success: Boolean) {
+      //Usb设备授权
+      if (success) {
+        MessageSender.sendUsbPlugStatus(usbDevice, 2)
+      }
+    }
+  }
+
+  private fun onUsbBroadListen() {
+    UsbDeviceHelper.instance.setUsbListener(usbBroadListener)
+    UsbDeviceHelper.instance.registerUsbReceiver(MessageSender.applicationContext)
+  }
+
+  override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+    MessageSender.applicationContext = flutterPluginBinding.applicationContext
+    this.binaryMessenger = flutterPluginBinding.binaryMessenger
+    channel = MethodChannel(
+      binaryMessenger,
+      "drago_usb_printer"
+    )
+    eventChannel =
+      EventChannel(binaryMessenger, "drago_usb_printer_event_channel")
     channel.setMethodCallHandler(this)
-    context = flutterPluginBinding.applicationContext
-    adapter = USBPrinterAdapter().getInstance()
+    eventChannel.setStreamHandler(this)
+
+    usbConnCache = HashMap()
+    UsbDeviceHelper.instance.init(flutterPluginBinding.applicationContext)
+    onUsbBroadListen()
   }
 
-  override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
+  override fun onMethodCall(call: MethodCall, result: Result) {
     when (call.method) {
-        "getUSBDeviceList" -> {
-          getUSBDeviceList(result)
+      "getUSBDeviceList" -> {
+        result.success(UsbDeviceHelper.instance.queryLocalPrinterMap())
+      }
+      "printText" -> {
+        val text = call.argument<String?>("text")
+        if(text != null) {
+          val data = text.toByteArray(Charset.forName("UTF-8"))
+          write(call, data, result)
         }
-        "connect" -> {
-          val vendorId = call.argument<Int>("vendorId")
-          val productId = call.argument<Int>("productId")
-          connect(vendorId!!, productId!!, result)
+      }
+      "printRawText" -> {
+        val raw = call.argument<String>("raw")
+        val data = Base64.decode(raw, Base64.DEFAULT)
+        data?.let { write(call, it,  result) }
+      }
+      "write" -> {
+        val data = call.argument<ByteArray>("data")
+        if(data != null) write(call, data,  result) else result.success(false)
+      }
+      "checkDeviceConn" -> {
+        val device = MethodCallParser.parseDevice(call)
+        if (device != null) {
+          val usbDevice = device.usbDevice
+          val deviceId = device.deviceId
+          if (!usbConnCache.contains(deviceId)) {
+            usbConnCache[deviceId] = UsbConn(usbDevice)
+          }
+          result.success(usbConnCache[deviceId]!!.isConn)
+        } else {
+          val error = "usb error"
+          result.error("-1", error, error)
         }
-        "close" -> {
-          close(result)
+      }
+      "connect" -> {
+        val device = MethodCallParser.parseDevice(call)
+        if (device != null) {
+          val usbDevice = device.usbDevice
+          val deviceId = device.deviceId
+          if (!usbConnCache.contains(deviceId)) {
+            usbConnCache[deviceId] = UsbConn(usbDevice)
+          }
+          try {
+            val connected = usbConnCache[deviceId]!!.connect()
+            result.success(connected)
+          } catch (e: Exception) {
+            val error = e.message ?: ""
+            result.error("-1", error, error)
+          }
+        } else {
+          val error = "usb error"
+          result.error("-1", error, error)
         }
-        "printText" -> {
-          val text = call.argument<String>("text")
-          printText(text, result)
+      }
+      "disconnect" -> {
+        val deviceId = MethodCallParser.parseDeviceId(call)
+        if (usbConnCache.contains(deviceId)) {
+          usbConnCache[deviceId]!!.disconnect()
+          usbConnCache.remove(deviceId)
+          result.success(true)
+        } else {
+          val error = "usb error"
+          result.error("-1", error, error)
         }
-        "printRawText" -> {
-          val raw = call.argument<String>("raw")
-          printRawText(raw, result)
+      }
+      "checkDevicePermission" -> {
+        val device = MethodCallParser.parseDevice(call)
+        if (device != null) {
+          result.success(UsbDeviceHelper.instance.hasPermission(device.usbDevice))
+        } else {
+          val error = "usb error"
+          result.error("-1", error, error)
         }
-        "write" -> {
-          val data = call.argument<ByteArray>("data")
-          write(data, result)
+      }
+      "requestDevicePermission" -> {
+        val device = MethodCallParser.parseDevice(call)
+        if (device != null) {
+          UsbDeviceHelper.instance.requestPermission(device.usbDevice)
+          result.success(true)
+        } else {
+          val error = "usb error"
+          result.error("-1", error, error)
         }
-        else -> {
-          result.notImplemented()
-        }
+      }
+      "removeUsbConnCache" -> {
+        val deviceId = MethodCallParser.parseDeviceId(call)
+        removeConnCacheWithKey(deviceId)
+        result.success(true)
+      }
     }
   }
+  private fun write(call: MethodCall, bytes: ByteArray, result: Result) {
+    val usbConn = fetchUsbConn(call)
+    if (usbConn != null) {
+        Thread {
+          try {
+            usbConn.writeBytes(bytes)
+            GlobalScope.launch {
+              withContext(Dispatchers.Main) {
+                result.success(true)
+              }
+            }
+          } catch (e: Exception) {
+            val error = e.message ?: ""
+            GlobalScope.launch {
+              withContext(Dispatchers.Main) {
+                result.error("-1", error, error)
+              }
+            }
+          }
+        }.start()
 
-  private fun getUSBDeviceList(result: Result) {
-
-    val usbDevices = adapter!!.getDeviceList()
-    val list = ArrayList<HashMap<String, String?>>()
-    for (usbDevice in usbDevices) {
-      val deviceMap: HashMap<String, String?> = HashMap()
-      deviceMap["deviceName"] = usbDevice.deviceName
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-        deviceMap["manufacturer"] = usbDevice.manufacturerName
-      }else{
-        deviceMap["manufacturer"] = "unknown";
-      }
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-        deviceMap["productName"] = usbDevice.productName
-      }else{
-        deviceMap["productName"] = "unknown";
-      }
-      deviceMap["deviceId"] = Integer.toString(usbDevice.deviceId)
-      deviceMap["vendorId"] = Integer.toString(usbDevice.vendorId)
-      deviceMap["productId"] = Integer.toString(usbDevice.productId)
-      list.add(deviceMap)
-      print("usbDevice ${usbDevice}");
-    }
-    result.success(list)
-  }
-
-  private fun connect(vendorId: Int, productId: Int, result: Result) {
-    if (!adapter!!.selectDevice(vendorId!!, productId!!)) {
-      result.success(false)
     } else {
-      result.success(true)
+      val error = "usb error"
+      result.error("-1", error, error)
     }
   }
 
-  private fun close(result: Result) {
-    adapter!!.closeConnectionIfExists()
-    result.success(true)
+  private fun fetchUsbConn(call: MethodCall): UsbConn? {
+    val deviceId = MethodCallParser.parseDeviceId(call)
+    if (!usbConnCache.contains(deviceId)) {
+      val device = MethodCallParser.parseDevice(call)
+      if (device != null) {
+        usbConnCache[deviceId] = UsbConn(device.usbDevice)
+      }
+    }
+    return usbConnCache[deviceId]
   }
 
-  private fun printText(text : String?, result  :Result) {
-    text?.let { adapter!!.printText(it) };
-    result.success(true);
+  private fun removeConnCacheWithKey(key: String) {
+    val removeCaches = arrayListOf<String>()
+    usbConnCache.keys.forEach {
+      if (it.contains(key)) {
+        removeCaches.add(it)
+      }
+    }
+    if (removeCaches.isNotEmpty()) {
+      removeCaches.forEach {
+        usbConnCache.remove(it)
+      }
+    }
   }
 
-  private fun printRawText(base64Data: String?, result: Result) {
-    adapter!!.printRawText(base64Data!!)
-    result.success(true)
-  }
-
-  private fun write(bytes: ByteArray?, result: Result) {
-    bytes?.let { adapter!!.write(it) }
-    result.success(true)
-  }
-
-  override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+  override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
     channel.setMethodCallHandler(null)
+    eventChannel.setStreamHandler(null)
+    UsbDeviceHelper.instance.unRegisterUsbReceiver(binding.applicationContext)
   }
 
-  override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-    print("onAttachedToActivity")
-    activity = binding.activity
-    adapter!!.init(activity);
+  override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+    MessageSender.eventSink = events
   }
 
-  override fun onDetachedFromActivityForConfigChanges() {
-    // This call will be followed by onReattachedToActivityForConfigChanges().
-    print("onDetachedFromActivityForConfigChanges");
-  }
-
-  override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
-    print("onAttachedToActivity")
-    onAttachedToActivity(binding)
-  }
-
-  override fun onDetachedFromActivity() {
-    // This call will be followed by onDetachedFromActivity().
-    print("onDetachedFromActivity")
+  override fun onCancel(arguments: Any?) {
+    //暂无处理
   }
 }

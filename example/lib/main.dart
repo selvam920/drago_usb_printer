@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:drago_usb_printer/drago_usb_printer.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -15,7 +14,8 @@ class _MyAppState extends State<MyApp> {
   List<Map<String, dynamic>> devices = [];
   DragoUsbPrinter dragoUsbPrinter = DragoUsbPrinter();
   bool connected = false;
-
+  int vendorId = 0;
+  int productId = 0;
   @override
   initState() {
     super.initState();
@@ -40,6 +40,8 @@ class _MyAppState extends State<MyApp> {
       //response = 'Failed to get platform version.';
     }
     if (returned!) {
+      this.vendorId = vendorId;
+      this.productId = productId;
       setState(() {
         connected = true;
       });
@@ -50,7 +52,7 @@ class _MyAppState extends State<MyApp> {
     try {
       var data = Uint8List.fromList(
           utf8.encode(" Hello world Testing ESC POS printer..."));
-      await dragoUsbPrinter.write(data);
+      await dragoUsbPrinter.write(data, vendorId, productId);
       // await DragoUsbPrinter.printRawData("text");
       // await DragoUsbPrinter.printText("Testing ESC POS printer...");
     } on PlatformException {

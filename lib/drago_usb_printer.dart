@@ -30,6 +30,7 @@ class DragoUsbPrinter {
       "productId": productId
     };
     final bool? result = await _channel.invokeMethod('connect', params);
+    print('connected $result');
     return result;
   }
 
@@ -58,8 +59,12 @@ class DragoUsbPrinter {
 
   /// [write]
   /// write data byte
-  Future<bool?> write(Uint8List data) async {
-    Map<String, dynamic> params = {"data": data};
+  Future<bool?> write(Uint8List data, int vendorId, int productId) async {
+    Map<String, dynamic> params = {
+      "data": data,
+      "vendorId": vendorId,
+      "productId": productId
+    };
     final bool? result = await _channel.invokeMethod('write', params);
     return result;
   }
