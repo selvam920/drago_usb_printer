@@ -37,7 +37,7 @@ class DragoUsbPrinter {
   /// [close]
   /// close the connection after print with usb printer
   Future<bool?> close() async {
-    final bool? result = await _channel.invokeMethod('close');
+    final bool? result = await _channel.invokeMethod('disconnect');
     return result;
   }
 

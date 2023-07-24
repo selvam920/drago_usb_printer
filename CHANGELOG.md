@@ -13,3 +13,7 @@
 ## 0.0.5
 
 * Flutter 3.10
+
+## 0.0.6
+
+* Write bytes by vendorid and productid
