@@ -17,3 +17,7 @@
 ## 0.0.6
 
 * Write bytes by vendorid and productid
+
+## 0.0.7
+
+* Fix disconnect
