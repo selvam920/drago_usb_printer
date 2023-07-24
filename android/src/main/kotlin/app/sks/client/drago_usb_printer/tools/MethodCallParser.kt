@@ -29,11 +29,9 @@ object MethodCallParser {
     }
 
     fun parseDeviceId(call: MethodCall): String {
-        val vID = call.argument<Int>("vId")
-        val pID = call.argument<Int>("pId")
-        val sID = call.argument<String>("sId")
-        val position = call.argument<Int>("position")
-        return "$vID - $pID - $sID - $position"
+        val vendorId = call.argument<Int>("vendorId")
+        val productId = call.argument<Int>("productId")
+        return "$vendorId - $productId"
     }
 
 }

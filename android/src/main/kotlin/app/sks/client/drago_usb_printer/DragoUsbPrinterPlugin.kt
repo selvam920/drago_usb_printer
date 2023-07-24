@@ -42,7 +42,7 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
     override fun onDeviceDetached(usbDevice: UsbDevice?) {
       //Usb设备拔出
       usbDevice?.let {
-        val deviceId = "${it.vendorId} - ${it.productId} - "
+        val deviceId = "${it.vendorId} - ${it.productId}"
         removeConnCacheWithKey(deviceId)
         MessageSender.sendUsbPlugStatus(usbDevice, 0)
       }
