@@ -170,6 +170,7 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
       }
     }
   }
+  
   private fun write(call: MethodCall, bytes: ByteArray, result: Result) {
     val usbConn = fetchUsbConn(call)
     if (usbConn != null) {
