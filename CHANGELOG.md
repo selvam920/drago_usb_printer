@@ -25,3 +25,7 @@
 ## 0.0.8
 
 * Fix disconnect
+
+## 0.0.9
+
+* Migrated to flutter >= 3.3.0
