@@ -32,7 +32,7 @@ class UsbDeviceHelper private constructor() {
                 PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE)
         } else {
             mPermissionIntent =
-                PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_ONE_SHOT)
+                PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE)
         }
         usbManager = context.applicationContext.getSystemService(Context.USB_SERVICE) as UsbManager
     }

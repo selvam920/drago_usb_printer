@@ -33,3 +33,7 @@
 ## 0.1.0
 
 * Migrated to gradle > 8.0
+
+## 0.1.1
+
+* Fixed issue with <= android 11
