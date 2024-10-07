@@ -27,7 +27,12 @@ class UsbDeviceHelper private constructor() {
 
     fun init(context: Context) {
         this.mContext = context
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= 33){
+            val intent: Intent = Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION)
+            intent.setPackage(mContext.packageName)
+            mPermissionIntent =
+                PendingIntent.getActivity(context, 0,  intent, PendingIntent.FLAG_MUTABLE)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             mPermissionIntent =
                 PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE)
         } else {
