@@ -37,3 +37,7 @@
 ## 0.1.1
 
 * Fixed issue with <= android 11
+
+## 0.1.2
+
+* Fixed issue with >= android 14

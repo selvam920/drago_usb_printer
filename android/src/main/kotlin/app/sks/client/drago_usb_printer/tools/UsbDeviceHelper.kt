@@ -27,14 +27,14 @@ class UsbDeviceHelper private constructor() {
 
     fun init(context: Context) {
         this.mContext = context
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            mPermissionIntent =
-                PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE)
-        } else {
+        // if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        //     mPermissionIntent =
+        //         PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_MUTABLE  or PendingIntent.FLAG_NO_CREATE)
+        // } else {
             mPermissionIntent =
                 PendingIntent.getActivity(context, 0,  Intent(UsbDeviceReceiver.Config.ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE)
-        }
-        usbManager = context.applicationContext.getSystemService(Context.USB_SERVICE) as UsbManager
+        // }
+        usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     }
 
     fun setUsbListener(listener: OnUsbListener) {
