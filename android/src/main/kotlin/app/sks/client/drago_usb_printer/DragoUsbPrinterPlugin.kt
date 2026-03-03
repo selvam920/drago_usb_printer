@@ -13,8 +13,10 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.charset.Charset
@@ -26,6 +28,12 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
   private lateinit var eventChannel: EventChannel
 
   private lateinit var usbConnCache: HashMap<String, UsbConn>
+  private val pluginScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+  companion object {
+    private const val ERROR_USB = "USB device not found or not accessible"
+    private const val ERROR_CODE = "-1"
+  }
 
   private val usbBroadListener = object : OnUsbListener {
     override fun onDeviceAttached(usbDevice: UsbDevice?) {
@@ -81,7 +89,14 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
   override fun onMethodCall(call: MethodCall, result: Result) {
     when (call.method) {
       "getUSBDeviceList" -> {
-        result.success(UsbDeviceHelper.instance.queryLocalPrinterMap())
+        pluginScope.launch {
+          try {
+            val devices = UsbDeviceHelper.instance.queryLocalPrinterMapAsync()
+            result.success(devices)
+          } catch (e: Exception) {
+            result.error(ERROR_CODE, e.message ?: "Failed to get device list", null)
+          }
+        }
       }
       "printText" -> {
         val text = call.argument<String?>("text")
@@ -104,13 +119,12 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
         if (device != null) {
           val usbDevice = device.usbDevice
           val deviceId = device.deviceId
-          if (!usbConnCache.contains(deviceId)) {
+          if (!usbConnCache.containsKey(deviceId)) {
             usbConnCache[deviceId] = UsbConn(usbDevice)
           }
           result.success(usbConnCache[deviceId]!!.isConn)
         } else {
-          val error = "usb error"
-          result.error("-1", error, error)
+          result.error(ERROR_CODE, ERROR_USB, null)
         }
       }
       "connect" -> {
@@ -118,30 +132,27 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
         if (device != null) {
           val usbDevice = device.usbDevice
           val deviceId = device.deviceId
-          if (!usbConnCache.contains(deviceId)) {
+          if (!usbConnCache.containsKey(deviceId)) {
             usbConnCache[deviceId] = UsbConn(usbDevice)
           }
           try {
             val connected = usbConnCache[deviceId]!!.connect()
             result.success(connected)
           } catch (e: Exception) {
-            val error = e.message ?: ""
-            result.error("-1", error, error)
+            result.error(ERROR_CODE, e.message ?: "Connection failed", null)
           }
         } else {
-          val error = "usb error"
-          result.error("-1", error, error)
+          result.error(ERROR_CODE, ERROR_USB, null)
         }
       }
       "disconnect" -> {
         val deviceId = MethodCallParser.parseDeviceId(call)
-        if (usbConnCache.contains(deviceId)) {
+        if (usbConnCache.containsKey(deviceId)) {
           usbConnCache[deviceId]!!.disconnect()
           usbConnCache.remove(deviceId)
           result.success(true)
         } else {
-          val error = "usb error"
-          result.error("-1", error, error)
+          result.error(ERROR_CODE, ERROR_USB, null)
         }
       }
       "checkDevicePermission" -> {
@@ -149,8 +160,7 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
         if (device != null) {
           result.success(UsbDeviceHelper.instance.hasPermission(device.usbDevice))
         } else {
-          val error = "usb error"
-          result.error("-1", error, error)
+          result.error(ERROR_CODE, ERROR_USB, null)
         }
       }
       "requestDevicePermission" -> {
@@ -159,8 +169,7 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
           UsbDeviceHelper.instance.requestPermission(device.usbDevice)
           result.success(true)
         } else {
-          val error = "usb error"
-          result.error("-1", error, error)
+          result.error(ERROR_CODE, ERROR_USB, null)
         }
       }
       "removeUsbConnCache" -> {
@@ -174,33 +183,24 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
   private fun write(call: MethodCall, bytes: ByteArray, result: Result) {
     val usbConn = fetchUsbConn(call)
     if (usbConn != null) {
-        Thread {
-          try {
+      pluginScope.launch {
+        try {
+          withContext(Dispatchers.IO) {
             usbConn.writeBytes(bytes)
-            GlobalScope.launch {
-              withContext(Dispatchers.Main) {
-                result.success(true)
-              }
-            }
-          } catch (e: Exception) {
-            val error = e.message ?: ""
-            GlobalScope.launch {
-              withContext(Dispatchers.Main) {
-                result.error("-1", error, error)
-              }
-            }
           }
-        }.start()
-
+          result.success(true)
+        } catch (e: Exception) {
+          result.error(ERROR_CODE, e.message ?: "Write failed", null)
+        }
+      }
     } else {
-      val error = "usb error"
-      result.error("-1", error, error)
+      result.error(ERROR_CODE, ERROR_USB, null)
     }
   }
 
   private fun fetchUsbConn(call: MethodCall): UsbConn? {
     val deviceId = MethodCallParser.parseDeviceId(call)
-    if (!usbConnCache.contains(deviceId)) {
+    if (!usbConnCache.containsKey(deviceId)) {
       val device = MethodCallParser.parseDevice(call)
       if (device != null) {
         usbConnCache[deviceId] = UsbConn(device.usbDevice)
@@ -224,6 +224,7 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
   }
 
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+    pluginScope.cancel()
     channel.setMethodCallHandler(null)
     eventChannel.setStreamHandler(null)
     UsbDeviceHelper.instance.unRegisterUsbReceiver(binding.applicationContext)

@@ -2,11 +2,9 @@ package app.sks.client.drago_usb_printer.tools
 
 import android.content.Context
 import android.hardware.usb.UsbDevice
+import android.os.Handler
+import android.os.Looper
 import io.flutter.plugin.common.EventChannel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * @Description:    将消息发送给 flutter 端
@@ -20,11 +18,13 @@ abstract class MessageSender {
         lateinit var applicationContext: Context
         var eventSink: EventChannel.EventSink? = null
 
-        private fun doOnMain(pFunc: () -> Unit) {
-            GlobalScope.launch {
-                withContext(Dispatchers.Main) {
-                    pFunc.invoke()
-                }
+        private val mainHandler = Handler(Looper.getMainLooper())
+
+        private fun doOnMain(block: () -> Unit) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                block()
+            } else {
+                mainHandler.post(block)
             }
         }
 

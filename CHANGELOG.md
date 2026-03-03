@@ -41,3 +41,7 @@
 ## 0.1.2
 
 * Fixed issue with >= android 14
+
+## 0.1.3
+
+* Improve usb print performance 
