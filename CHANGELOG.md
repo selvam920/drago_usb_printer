@@ -45,3 +45,7 @@
 ## 0.1.3
 
 * Improve usb print performance 
+
+## 0.1.4
+
+* Improve bulk usb print 

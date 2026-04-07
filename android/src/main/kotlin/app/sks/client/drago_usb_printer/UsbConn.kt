@@ -27,14 +27,18 @@ class UsbConn(private val mUsbDevice: UsbDevice) {
     private var mInterruptEndOut: UsbEndpoint? = null
 
     companion object {
-        /** Max chunk size for bulk transfers (16 KB) */
-        private const val DEFAULT_CHUNK_SIZE = 16 * 1024
+        /** Initial chunk size — will be halved automatically on transfer failures */
+        private const val INITIAL_CHUNK_SIZE = 8 * 1024
+        /** Minimum chunk size before giving up */
+        private const val MIN_CHUNK_SIZE = 512
         /** Timeout per chunk in ms */
-        private const val CHUNK_TIMEOUT_MS = 5000
-        /** Max retries per chunk on transient failure */
+        private const val CHUNK_TIMEOUT_MS = 8000
+        /** Max retries per chunk at any given chunk-size level */
         private const val MAX_RETRIES = 3
         /** Delay between retries in ms */
-        private const val RETRY_DELAY_MS = 50L
+        private const val RETRY_DELAY_MS = 100L
+        /** Throttle delay applied only after a chunk needed retries */
+        private const val BACKPRESSURE_DELAY_MS = 20L
     }
 
     private fun checkConnAndReConnect(): Boolean {
@@ -110,10 +114,12 @@ class UsbConn(private val mUsbDevice: UsbDevice) {
     }
 
     /**
-     * Write data in chunks sized to the endpoint's max packet size (or DEFAULT_CHUNK_SIZE).
-     * - Splits large payloads into manageable pieces to avoid USB transfer timeouts.
-     * - Retries each chunk up to MAX_RETRIES on transient failures.
-     * - Synchronized so concurrent writes don't interleave on the same connection.
+     * Write data using adaptive chunking for large payloads (e.g. barcode images).
+     *
+     * - Uses offset-based bulkTransfer to avoid allocating a byte-array copy per chunk.
+     * - Starts with a larger chunk size for throughput; automatically halves it on
+     *   repeated failures so slow printers still work.
+     * - Only applies back-pressure delay after a chunk required retries.
      *
      * @return total number of bytes successfully transferred
      * @throws Exception on unrecoverable write failure
@@ -128,63 +134,86 @@ class UsbConn(private val mUsbDevice: UsbDevice) {
             val endpoint = mBulkEndOut
                 ?: throw Exception("Bulk OUT endpoint not available")
 
-            val chunkSize = resolveChunkSize(endpoint)
+            var chunkSize = resolveChunkSize(endpoint)
             var totalSent = 0
             var offset = 0
 
             while (offset < data.size) {
                 val length = min(chunkSize, data.size - offset)
-                val chunk = if (offset == 0 && length == data.size) {
-                    data  // avoid copy when data fits in one chunk
-                } else {
-                    data.copyOfRange(offset, offset + length)
-                }
 
-                val sent = transferChunkWithRetry(connection, endpoint, chunk, length)
-                totalSent += sent
-                offset += length
+                val result = transferChunkAdaptive(connection, endpoint, data, offset, length)
+                when {
+                    result.sent > 0 -> {
+                        totalSent += result.sent
+                        offset += result.sent
+                        // Only throttle when the chunk needed retries (printer is under pressure)
+                        if (result.retriesUsed > 0 && offset < data.size) {
+                            Thread.sleep(BACKPRESSURE_DELAY_MS)
+                        }
+                    }
+                    result.shouldReduceChunk && chunkSize > MIN_CHUNK_SIZE -> {
+                        // Halve the chunk size and retry from the same offset
+                        chunkSize = (chunkSize / 2).coerceAtLeast(MIN_CHUNK_SIZE)
+                        Thread.sleep(RETRY_DELAY_MS)
+                    }
+                    else -> {
+                        throw Exception(
+                            "USB bulk transfer failed " +
+                            "(error=${result.lastError}, chunkSize=$length, " +
+                            "offset=$offset, totalSize=${data.size}, " +
+                            "endpointMaxPacket=${endpoint.maxPacketSize})"
+                        )
+                    }
+                }
             }
             return totalSent
         }
     }
 
+    private data class ChunkResult(
+        val sent: Int,
+        val retriesUsed: Int,
+        val lastError: Int,
+        val shouldReduceChunk: Boolean
+    )
+
     /**
-     * Transfer a single chunk with retry logic.
+     * Try to send a single chunk. Returns a result indicating success/failure
+     * so the caller can decide whether to reduce chunk size or abort.
      */
-    private fun transferChunkWithRetry(
+    private fun transferChunkAdaptive(
         connection: UsbDeviceConnection,
         endpoint: UsbEndpoint,
-        chunk: ByteArray,
+        data: ByteArray,
+        offset: Int,
         length: Int
-    ): Int {
+    ): ChunkResult {
         var lastError = -1
         for (attempt in 1..MAX_RETRIES) {
-            val sent = connection.bulkTransfer(endpoint, chunk, length, CHUNK_TIMEOUT_MS)
+            val sent = connection.bulkTransfer(endpoint, data, offset, length, CHUNK_TIMEOUT_MS)
             if (sent >= 0) {
-                return sent
+                return ChunkResult(sent = sent, retriesUsed = attempt - 1, lastError = 0, shouldReduceChunk = false)
             }
             lastError = sent
             if (attempt < MAX_RETRIES) {
                 Thread.sleep(RETRY_DELAY_MS)
             }
         }
-        throw Exception(
-            "USB bulk transfer failed after $MAX_RETRIES retries (error=$lastError, chunkSize=$length)"
-        )
+        // All retries exhausted — signal caller to try a smaller chunk
+        return ChunkResult(sent = 0, retriesUsed = MAX_RETRIES, lastError = lastError, shouldReduceChunk = true)
     }
 
     /**
-     * Determine optimal chunk size: use a multiple of the endpoint's maxPacketSize,
-     * capped at DEFAULT_CHUNK_SIZE.
+     * Determine initial chunk size: largest multiple of endpoint maxPacketSize
+     * that fits within INITIAL_CHUNK_SIZE.
      */
     private fun resolveChunkSize(endpoint: UsbEndpoint): Int {
         val maxPacket = endpoint.maxPacketSize
         return if (maxPacket > 0) {
-            // Use the largest multiple of maxPacketSize that fits within DEFAULT_CHUNK_SIZE
-            val multiplier = DEFAULT_CHUNK_SIZE / maxPacket
+            val multiplier = INITIAL_CHUNK_SIZE / maxPacket
             if (multiplier > 0) multiplier * maxPacket else maxPacket
         } else {
-            DEFAULT_CHUNK_SIZE
+            INITIAL_CHUNK_SIZE
         }
     }
 
