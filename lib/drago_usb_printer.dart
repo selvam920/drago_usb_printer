@@ -42,10 +42,10 @@ class DragoUsbPrinter {
 
   /// [close]
   /// close the connection after print with usb printer
-  Future<bool?> close() async {
+  Future<bool?> close({int? vid, int? pid}) async {
     Map<String, dynamic> params = {
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('disconnect', params);
     return result;
@@ -53,11 +53,11 @@ class DragoUsbPrinter {
 
   /// [printText]
   /// print text
-  Future<bool?> printText(String text) async {
+  Future<bool?> printText(String text, {int? vid, int? pid}) async {
     Map<String, dynamic> params = {
       "text": text,
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('printText', params);
     return result;
@@ -65,11 +65,11 @@ class DragoUsbPrinter {
 
   /// [printRawText]
   /// print raw text
-  Future<bool?> printRawText(String text) async {
+  Future<bool?> printRawText(String text, {int? vid, int? pid}) async {
     Map<String, dynamic> params = {
       "raw": text,
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('printRawText', params);
     return result;
@@ -77,11 +77,11 @@ class DragoUsbPrinter {
 
   /// [write]
   /// write data byte
-  Future<bool?> write(Uint8List data) async {
+  Future<bool?> write(Uint8List data, {int? vid, int? pid}) async {
     Map<String, dynamic> params = {
       "data": data,
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('write', params);
     return result;
