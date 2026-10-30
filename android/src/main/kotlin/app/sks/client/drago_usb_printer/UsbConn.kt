@@ -5,241 +5,201 @@ import android.os.SystemClock
 import app.sks.client.drago_usb_printer.tools.UsbDeviceHelper
 import kotlin.math.min
 
-
-/// Author       : liyufeng
-/// Date         : 14:42
-/// Description  : 
+/**
+ * One open connection to a USB printer. All state changes and transfers go
+ * through [mLock] so a disconnect cannot close the connection under a running
+ * transfer.
+ */
 class UsbConn(private val mUsbDevice: UsbDevice) {
 
+    @Volatile
     var isConn = false
+        private set
 
     private val mLock = Any()
-    private val mWriteLock = Any()
     private var mConnection: UsbDeviceConnection? = null
     private var mUsbInterface: UsbInterface? = null
-
-    //块传输模式
     private var mBulkEndIn: UsbEndpoint? = null
     private var mBulkEndOut: UsbEndpoint? = null
 
-    //中断传输模式
-    private var mInterruptEndIn: UsbEndpoint? = null
-    private var mInterruptEndOut: UsbEndpoint? = null
+    val device: UsbDevice get() = mUsbDevice
 
     companion object {
-        /** Initial chunk size — will be halved automatically on transfer failures */
         private const val INITIAL_CHUNK_SIZE = 8 * 1024
-        /** Minimum chunk size before giving up */
         private const val MIN_CHUNK_SIZE = 512
-        /** Timeout per chunk in ms */
         private const val CHUNK_TIMEOUT_MS = 8000
-        /** Max retries per chunk at any given chunk-size level */
         private const val MAX_RETRIES = 3
-        /** Delay between retries in ms */
         private const val RETRY_DELAY_MS = 100L
-        /** Throttle delay applied only after a chunk needed retries */
         private const val BACKPRESSURE_DELAY_MS = 20L
+
+        private fun endpoint(inf: UsbInterface, dir: Int): UsbEndpoint? =
+            (0 until inf.endpointCount).map { inf.getEndpoint(it) }.firstOrNull {
+                it.type == UsbConstants.USB_ENDPOINT_XFER_BULK && it.direction == dir
+            }
+
+        private fun isExcludedClass(c: Int): Boolean =
+            c == UsbConstants.USB_CLASS_MASS_STORAGE ||
+                c == UsbConstants.USB_CLASS_HID ||
+                c == UsbConstants.USB_CLASS_HUB ||
+                c == UsbConstants.USB_CLASS_AUDIO ||
+                c == UsbConstants.USB_CLASS_VIDEO ||
+                c == UsbConstants.USB_CLASS_WIRELESS_CONTROLLER
+
+        /** Printer-class interface with bulk OUT first, else any non-excluded interface with bulk OUT. */
+        fun pickInterface(device: UsbDevice): UsbInterface? {
+            val all = (0 until device.interfaceCount).map { device.getInterface(it) }
+            return all.firstOrNull {
+                it.interfaceClass == UsbConstants.USB_CLASS_PRINTER &&
+                    endpoint(it, UsbConstants.USB_DIR_OUT) != null
+            } ?: all.firstOrNull {
+                !isExcludedClass(it.interfaceClass) && endpoint(it, UsbConstants.USB_DIR_OUT) != null
+            }
+        }
     }
 
-    private fun checkConnAndReConnect(): Boolean {
-        if (!isConn) {
-            connect()
+    /** Opens (or re-opens) the device. Only a bulk OUT endpoint is required. */
+    fun connect(): Boolean = synchronized(mLock) { connectLocked() }
+
+    private fun connectLocked(): Boolean {
+        if (isConn && mConnection != null) return true
+        closeLocked()
+        val inf = pickInterface(mUsbDevice) ?: return false
+        val conn = UsbDeviceHelper.instance.openDevice(mUsbDevice) ?: return false
+        val claimed = try {
+            conn.claimInterface(inf, true)
+        } catch (e: Exception) {
+            false
         }
+        if (!claimed) {
+            try { conn.close() } catch (_: Exception) {}
+            return false
+        }
+        mConnection = conn
+        mUsbInterface = inf
+        mBulkEndOut = endpoint(inf, UsbConstants.USB_DIR_OUT)
+        mBulkEndIn = endpoint(inf, UsbConstants.USB_DIR_IN)
+        isConn = mBulkEndOut != null
+        if (!isConn) closeLocked()
         return isConn
     }
 
-    fun connect(): Boolean {
-        openPort()
-        isConn = mBulkEndOut != null && mBulkEndIn != null
-        return isConn
-    }
-
-    private fun openPort() {
-        val count = mUsbDevice.interfaceCount
-        var usbInf: UsbInterface? = null
-        for (index in 0 until count) {
-            val usbInterface = mUsbDevice.getInterface(index)
-            if (usbInterface.interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
-                usbInf = usbInterface
-            }
+    private fun closeLocked() {
+        val conn = mConnection
+        val inf = mUsbInterface
+        try {
+            if (conn != null && inf != null) conn.releaseInterface(inf)
+        } catch (_: Exception) {
         }
-        usbInf?.let {
-            mUsbInterface = usbInf
-            mConnection = UsbDeviceHelper.instance.openDevice(mUsbDevice)
-            if (!mConnection!!.claimInterface(usbInf, true)) {
-                return
-            }
-            for (i in 0 until usbInf.endpointCount) {
-                val ep = usbInf.getEndpoint(i)
-                when (ep.type) {
-                    UsbConstants.USB_ENDPOINT_XFER_BULK ->
-                        //usb 块传输
-                        if (ep.direction == UsbConstants.USB_DIR_OUT) {
-                            mBulkEndOut = ep
-                        } else {
-                            mBulkEndIn = ep
-                        }
-                    UsbConstants.USB_ENDPOINT_XFER_INT -> {
-                        //usb 中断传输
-                        if (ep.direction == UsbConstants.USB_DIR_OUT) {
-                            mInterruptEndOut = ep
-                        }
-                        if (ep.direction == UsbConstants.USB_DIR_IN) {
-                            mInterruptEndIn = ep
-                        }
-                    }
-                }
-            }
+        try {
+            conn?.close()
+        } catch (_: Exception) {
         }
+        mConnection = null
+        mUsbInterface = null
+        mBulkEndIn = null
+        mBulkEndOut = null
+        isConn = false
     }
 
     fun disconnect(): Boolean {
-        synchronized(mLock) {
-            if (!isConn) {
-                return true
-            }
-            try {
-                mUsbInterface?.let {
-                    mConnection?.releaseInterface(it)
-                    mConnection?.close()
-                }
-            } catch (e: Exception) {
-                //暂无处理
-            } finally {
-                mConnection = null
-                isConn = false
-            }
-        }
+        synchronized(mLock) { closeLocked() }
         return true
     }
 
-    /**
-     * Write data using adaptive chunking for large payloads (e.g. barcode images).
-     *
-     * - Uses offset-based bulkTransfer to avoid allocating a byte-array copy per chunk.
-     * - Starts with a larger chunk size for throughput; automatically halves it on
-     *   repeated failures so slow printers still work.
-     * - Only applies back-pressure delay after a chunk required retries.
-     *
-     * @return total number of bytes successfully transferred
-     * @throws Exception on unrecoverable write failure
-     */
-    fun writeBytes(data: ByteArray): Int {
-        if (!checkConnAndReConnect()) {
-            throw Exception("Printer not connected")
-        }
-        synchronized(mWriteLock) {
-            val connection = mConnection
-                ?: throw Exception("USB connection lost")
-            val endpoint = mBulkEndOut
-                ?: throw Exception("Bulk OUT endpoint not available")
+    /** Adaptive chunked write. Returns bytes sent; throws on unrecoverable failure. */
+    fun writeBytes(data: ByteArray): Int = synchronized(mLock) { writeLocked(data) }
 
-            var chunkSize = resolveChunkSize(endpoint)
-            var totalSent = 0
-            var offset = 0
+    private fun writeLocked(data: ByteArray): Int {
+        if (!connectLocked()) throw Exception("Printer not connected")
+        val connection = mConnection ?: throw Exception("USB connection lost")
+        val endpoint = mBulkEndOut ?: throw Exception("Bulk OUT endpoint not available")
 
-            while (offset < data.size) {
-                val length = min(chunkSize, data.size - offset)
-
-                val result = transferChunkAdaptive(connection, endpoint, data, offset, length)
-                when {
-                    result.sent > 0 -> {
-                        totalSent += result.sent
-                        offset += result.sent
-                        // Only throttle when the chunk needed retries (printer is under pressure)
-                        if (result.retriesUsed > 0 && offset < data.size) {
-                            Thread.sleep(BACKPRESSURE_DELAY_MS)
-                        }
-                    }
-                    result.shouldReduceChunk && chunkSize > MIN_CHUNK_SIZE -> {
-                        // Halve the chunk size and retry from the same offset
-                        chunkSize = (chunkSize / 2).coerceAtLeast(MIN_CHUNK_SIZE)
-                        Thread.sleep(RETRY_DELAY_MS)
-                    }
-                    else -> {
-                        throw Exception(
-                            "USB bulk transfer failed " +
-                            "(error=${result.lastError}, chunkSize=$length, " +
-                            "offset=$offset, totalSize=${data.size}, " +
-                            "endpointMaxPacket=${endpoint.maxPacketSize})"
-                        )
-                    }
+        var chunkSize = resolveChunkSize(endpoint)
+        var totalSent = 0
+        var offset = 0
+        while (offset < data.size) {
+            val length = min(chunkSize, data.size - offset)
+            val result = transferChunkAdaptive(connection, endpoint, data, offset, length)
+            when {
+                result.sent > 0 -> {
+                    totalSent += result.sent
+                    offset += result.sent
+                    if (result.retriesUsed > 0 && offset < data.size) Thread.sleep(BACKPRESSURE_DELAY_MS)
+                }
+                result.shouldReduceChunk && chunkSize > MIN_CHUNK_SIZE -> {
+                    chunkSize = (chunkSize / 2).coerceAtLeast(MIN_CHUNK_SIZE)
+                    Thread.sleep(RETRY_DELAY_MS)
+                }
+                else -> {
+                    // Probably detached or stalled: drop the connection so the next
+                    // call re-opens it cleanly instead of reusing a dead handle.
+                    closeLocked()
+                    throw Exception(
+                        "USB bulk transfer failed (error=${result.lastError}, chunkSize=$length, " +
+                            "offset=$offset, totalSize=${data.size}, endpointMaxPacket=${endpoint.maxPacketSize})"
+                    )
                 }
             }
-            return totalSent
         }
+        return totalSent
     }
 
-    private data class ChunkResult(
-        val sent: Int,
-        val retriesUsed: Int,
-        val lastError: Int,
-        val shouldReduceChunk: Boolean
-    )
+    private data class ChunkResult(val sent: Int, val retriesUsed: Int, val lastError: Int, val shouldReduceChunk: Boolean)
 
-    /**
-     * Try to send a single chunk. Returns a result indicating success/failure
-     * so the caller can decide whether to reduce chunk size or abort.
-     */
     private fun transferChunkAdaptive(
-        connection: UsbDeviceConnection,
-        endpoint: UsbEndpoint,
-        data: ByteArray,
-        offset: Int,
-        length: Int
+        connection: UsbDeviceConnection, endpoint: UsbEndpoint, data: ByteArray, offset: Int, length: Int
     ): ChunkResult {
         var lastError = -1
         for (attempt in 1..MAX_RETRIES) {
+            // 0 counts as failure: accepting it would loop forever at the same offset.
             val sent = connection.bulkTransfer(endpoint, data, offset, length, CHUNK_TIMEOUT_MS)
-            if (sent >= 0) {
-                return ChunkResult(sent = sent, retriesUsed = attempt - 1, lastError = 0, shouldReduceChunk = false)
-            }
+            if (sent > 0) return ChunkResult(sent, attempt - 1, 0, false)
             lastError = sent
-            if (attempt < MAX_RETRIES) {
-                Thread.sleep(RETRY_DELAY_MS)
-            }
+            if (attempt < MAX_RETRIES) Thread.sleep(RETRY_DELAY_MS)
         }
-        // All retries exhausted — signal caller to try a smaller chunk
-        return ChunkResult(sent = 0, retriesUsed = MAX_RETRIES, lastError = lastError, shouldReduceChunk = true)
+        return ChunkResult(0, MAX_RETRIES, lastError, true)
     }
 
-    /**
-     * Determine initial chunk size: largest multiple of endpoint maxPacketSize
-     * that fits within INITIAL_CHUNK_SIZE.
-     */
     private fun resolveChunkSize(endpoint: UsbEndpoint): Int {
         val maxPacket = endpoint.maxPacketSize
         return if (maxPacket > 0) {
             val multiplier = INITIAL_CHUNK_SIZE / maxPacket
             if (multiplier > 0) multiplier * maxPacket else maxPacket
-        } else {
-            INITIAL_CHUNK_SIZE
-        }
+        } else INITIAL_CHUNK_SIZE
     }
 
-    fun readBytes(timeOut: Int): ByteArray? {
-        if (!checkConnAndReConnect()) {
-            throw Exception("Printer not connected")
-        }
-        val connection = mConnection
-            ?: throw Exception("USB connection lost")
-        val endpointIn = mBulkEndIn
-            ?: throw Exception("Bulk IN endpoint not available")
+    /**
+     * Writes [query] then waits up to [timeOut] ms for a reply on the bulk IN
+     * endpoint. Returns null when there is no IN endpoint, no connection, or no reply.
+     */
+    fun query(query: ByteArray, timeOut: Int): ByteArray? = synchronized(mLock) {
+        if (!connectLocked()) return null
+        val conn = mConnection ?: return null
+        val ep = mBulkEndIn ?: return null
+        // Drain stale bytes from an earlier reply (bounded).
+        val junk = ByteArray(ep.maxPacketSize.coerceAtLeast(64))
+        var guard = 0
+        while (guard++ < 16 && conn.bulkTransfer(ep, junk, junk.size, 10) > 0) { }
+        if (query.isNotEmpty()) writeLocked(query)
+        readLocked(timeOut)
+    }
 
+    fun readBytes(timeOut: Int): ByteArray? = synchronized(mLock) {
+        if (!connectLocked()) return null
+        readLocked(timeOut)
+    }
+
+    private fun readLocked(timeOut: Int): ByteArray? {
+        val connection = mConnection ?: return null
+        val endpointIn = mBulkEndIn ?: return null
         val endTime = SystemClock.uptimeMillis() + timeOut.toLong()
         val buffer = ByteArray(endpointIn.maxPacketSize.coerceAtLeast(64))
         do {
-            val len = connection.bulkTransfer(endpointIn, buffer, buffer.size, timeOut)
-            if (len > 0) {
-                return buffer.copyOf(len)
-            }
-            try {
-                Thread.sleep(100L)
-            } catch (_: InterruptedException) {
-                // interrupted, retry
-            }
+            val remaining = (endTime - SystemClock.uptimeMillis()).toInt().coerceAtLeast(1)
+            val len = connection.bulkTransfer(endpointIn, buffer, buffer.size, remaining)
+            if (len > 0) return buffer.copyOf(len)
+            Thread.sleep(20L)
         } while (endTime > SystemClock.uptimeMillis())
         return null
     }
-
 }

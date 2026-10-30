@@ -21,12 +21,21 @@ class UsbDeviceReceiver : BroadcastReceiver() {
     }
 
     private var usbListener: OnUsbListener? = null
+    private var registered = false
+
+    @Suppress("DEPRECATION")
+    private fun deviceOf(intent: Intent): UsbDevice? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        } else {
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+        }
 
     override fun onReceive(context: Context, intent: Intent) {
         when {
             Config.ACTION_USB_PERMISSION == intent.action -> {
                 synchronized(this) {
-                    val usbDevice = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    val usbDevice = deviceOf(intent)
                     usbDevice?.let { device ->
                         val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                         // Notify UsbDeviceHelper to resolve any pending coroutine awaiting permission
@@ -36,11 +45,11 @@ class UsbDeviceReceiver : BroadcastReceiver() {
                 }
             }
             UsbManager.ACTION_USB_DEVICE_DETACHED == intent.action -> {
-                val usbDevice = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                val usbDevice = deviceOf(intent)
                 usbListener?.onDeviceDetached(usbDevice)
             }
             UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action -> {
-                val usbDevice = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                val usbDevice = deviceOf(intent)
                 usbListener?.onDeviceAttached(usbDevice)
             }
         }
@@ -54,6 +63,7 @@ class UsbDeviceReceiver : BroadcastReceiver() {
      * 注册广播
      */
     fun registerUsbReceiver(context: Context) {
+        if (registered) return
         val filter = IntentFilter(Config.ACTION_USB_PERMISSION)
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
@@ -62,13 +72,19 @@ class UsbDeviceReceiver : BroadcastReceiver() {
         } else {
             context.registerReceiver(this, filter)
         }
+        registered = true
     }
 
     /**
      * 取消注册
      */
     fun unRegisterUsbReceiver(context: Context) {
-        context.unregisterReceiver(this)
+        if (!registered) return
+        registered = false
+        try {
+            context.unregisterReceiver(this)
+        } catch (_: IllegalArgumentException) {
+        }
     }
 }
 

@@ -24,7 +24,7 @@ class UsbDeviceHelper private constructor() {
     private val pendingPermissions = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
     companion object {
-        val instance by lazy(LazyThreadSafetyMode.NONE) {
+        val instance by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
             UsbDeviceHelper()
         }
         private const val PERMISSION_TIMEOUT_MS = 60000L
@@ -124,50 +124,46 @@ class UsbDeviceHelper private constructor() {
 
     //过滤打印机类型的Usb设备
     private fun filterPrintUsbDevice(usbDevice: UsbDevice): Boolean {
-        var isFit = false
-        val count: Int = usbDevice.interfaceCount
-        for (index in 0 until count) {
-            val usbInterface: UsbInterface = usbDevice.getInterface(index)
-            if (usbInterface.interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
-                isFit = true
-                break
-            }
+        // Printer class, or a vendor-specific/other interface with a bulk OUT
+        // endpoint (many cheap thermal/label printers report class 0xFF).
+        // Mass storage, HID, hubs, audio/video are excluded in pickInterface.
+        return try {
+            app.sks.client.drago_usb_printer.UsbConn.pickInterface(usbDevice) != null
+        } catch (e: Exception) {
+            false
         }
-        return isFit
     }
 
-    //根据 vId、pId、sId 匹配 usbDevice
+    /** Attached device matching vId/pId (permitted or not); permitted ones win. */
     fun matchUsbDevice(vendorId: Int, productId: Int): UsbDevice? {
-        var usbDevice: UsbDevice? = null
-        val deviceList = queryPrinterDevices()
-        val hitDevices = arrayListOf<UsbDevice>()
-
-        deviceList.forEach { e ->
-            checkPermission(e)?.let { hasPermission ->
-                if (hasPermission) {
-                    if (e.vendorId == vendorId && e.productId == productId) {
-                        hitDevices.add(e)
-                    }
-                }
-            }
+        val hits = usbManager.deviceList.values.filter {
+            it.vendorId == vendorId && it.productId == productId
         }
-
-        if (hitDevices.isNotEmpty()) {
-            usbDevice = hitDevices.first()
-        }
-        return usbDevice
+        return hits.firstOrNull { hasPermission(it) } ?: hits.firstOrNull()
     }
 
-    fun openDevice(usbDevice: UsbDevice): UsbDeviceConnection {
-        return usbManager.openDevice(usbDevice)
+    /** UsbManager.openDevice may return null (no permission, device gone). */
+    fun openDevice(usbDevice: UsbDevice): UsbDeviceConnection? {
+        return try {
+            usbManager.openDevice(usbDevice)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     fun requestPermission(usbDevice: UsbDevice) {
-        usbManager.requestPermission(usbDevice, mPermissionIntent)
+        try {
+            usbManager.requestPermission(usbDevice, mPermissionIntent)
+        } catch (_: Exception) {
+        }
     }
 
     fun hasPermission(usbDevice: UsbDevice): Boolean {
-        return usbManager.hasPermission(usbDevice)
+        return try {
+            usbManager.hasPermission(usbDevice)
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
@@ -181,17 +177,28 @@ class UsbDeviceHelper private constructor() {
         if (hasPermission(usbDevice)) return true
 
         val key = "${usbDevice.vendorId}-${usbDevice.productId}"
-        val deferred = CompletableDeferred<Boolean>()
-        pendingPermissions[key] = deferred
-
-        usbManager.requestPermission(usbDevice, mPermissionIntent)
+        // Join an in-flight request for the same device instead of replacing it
+        // (replacing would leave the first caller waiting until timeout).
+        var created = false
+        val deferred = pendingPermissions.getOrPut(key) {
+            created = true
+            CompletableDeferred()
+        }
+        if (created) {
+            try {
+                usbManager.requestPermission(usbDevice, mPermissionIntent)
+            } catch (e: Exception) {
+                pendingPermissions.remove(key)
+                return false
+            }
+        }
 
         return try {
             withTimeout(timeoutMs) { deferred.await() }
         } catch (e: Exception) {
             false
         } finally {
-            pendingPermissions.remove(key)
+            if (created) pendingPermissions.remove(key)
         }
     }
 
@@ -200,7 +207,8 @@ class UsbDeviceHelper private constructor() {
      */
     fun onPermissionResult(usbDevice: UsbDevice, granted: Boolean) {
         val key = "${usbDevice.vendorId}-${usbDevice.productId}"
-        pendingPermissions[key]?.complete(granted)
+        // Re-check with UsbManager: the receiver is exported, so the extra alone is not trusted.
+        pendingPermissions[key]?.complete(granted && hasPermission(usbDevice))
     }
 
     //校验申请usb设备权限

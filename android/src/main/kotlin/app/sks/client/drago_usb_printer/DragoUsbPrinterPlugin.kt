@@ -7,7 +7,6 @@ import app.sks.client.drago_usb_printer.tools.MethodCallParser
 import app.sks.client.drago_usb_printer.tools.OnUsbListener
 import app.sks.client.drago_usb_printer.tools.UsbDeviceHelper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -19,215 +18,185 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.nio.charset.Charset
+import java.util.concurrent.ConcurrentHashMap
 
 /** DragoUsbPrinterPlugin */
 class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
-  private lateinit var binaryMessenger: BinaryMessenger
   private lateinit var channel: MethodChannel
   private lateinit var eventChannel: EventChannel
 
-  private lateinit var usbConnCache: HashMap<String, UsbConn>
+  private val usbConnCache = ConcurrentHashMap<String, UsbConn>()
   private val pluginScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
   companion object {
     private const val ERROR_USB = "USB device not found or not accessible"
+    private const val ERROR_PERMISSION = "USB permission denied"
     private const val ERROR_CODE = "-1"
   }
 
   private val usbBroadListener = object : OnUsbListener {
     override fun onDeviceAttached(usbDevice: UsbDevice?) {
-      //Usb设备插入
       usbDevice?.let {
-        UsbDeviceHelper.instance.checkPermission(it)?.let { hasPermission ->
-          if (hasPermission) {
-            MessageSender.sendUsbPlugStatus(usbDevice, 1)
-          }
-        }
+        // Only report; don't pop a permission dialog for every plugged device.
+        if (UsbDeviceHelper.instance.hasPermission(it)) MessageSender.sendUsbPlugStatus(it, 1)
       }
     }
 
     override fun onDeviceDetached(usbDevice: UsbDevice?) {
-      //Usb设备拔出
       usbDevice?.let {
-        val deviceId = "${it.vendorId} - ${it.productId}"
-        removeConnCacheWithKey(deviceId)
-        MessageSender.sendUsbPlugStatus(usbDevice, 0)
+        removeConnCacheWithKey(deviceKey(it.vendorId, it.productId))
+        MessageSender.sendUsbPlugStatus(it, 0)
       }
     }
 
     override fun onDeviceGranted(usbDevice: UsbDevice, success: Boolean) {
-      //Usb设备授权
-      if (success) {
-        MessageSender.sendUsbPlugStatus(usbDevice, 2)
-      }
+      if (success) MessageSender.sendUsbPlugStatus(usbDevice, 2)
     }
   }
 
-  private fun onUsbBroadListen() {
-    UsbDeviceHelper.instance.setUsbListener(usbBroadListener)
-    UsbDeviceHelper.instance.registerUsbReceiver(MessageSender.applicationContext)
-  }
+  private fun deviceKey(vendorId: Int?, productId: Int?) = "$vendorId - $productId"
 
   override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
     MessageSender.applicationContext = flutterPluginBinding.applicationContext
-    this.binaryMessenger = flutterPluginBinding.binaryMessenger
-    channel = MethodChannel(
-      binaryMessenger,
-      "drago_usb_printer"
-    )
-    eventChannel =
-      EventChannel(binaryMessenger, "drago_usb_printer_event_channel")
+    channel = MethodChannel(flutterPluginBinding.binaryMessenger, "drago_usb_printer")
+    eventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "drago_usb_printer_event_channel")
     channel.setMethodCallHandler(this)
     eventChannel.setStreamHandler(this)
 
-    usbConnCache = HashMap()
     UsbDeviceHelper.instance.init(flutterPluginBinding.applicationContext)
-    onUsbBroadListen()
+    UsbDeviceHelper.instance.setUsbListener(usbBroadListener)
+    UsbDeviceHelper.instance.registerUsbReceiver(flutterPluginBinding.applicationContext)
   }
 
+  /**
+   * Every branch replies exactly once. Blocking USB work runs on IO; replies are
+   * delivered on Main (pluginScope dispatcher).
+   */
   override fun onMethodCall(call: MethodCall, result: Result) {
     when (call.method) {
-      "getUSBDeviceList" -> {
-        pluginScope.launch {
-          try {
-            val devices = UsbDeviceHelper.instance.queryLocalPrinterMapAsync()
-            result.success(devices)
-          } catch (e: Exception) {
-            result.error(ERROR_CODE, e.message ?: "Failed to get device list", null)
-          }
-        }
+      "getUSBDeviceList" -> launchReply(result, "Failed to get device list") {
+        UsbDeviceHelper.instance.queryLocalPrinterMapAsync()
       }
       "printText" -> {
-        val text = call.argument<String?>("text")
-        if(text != null) {
-          val data = text.toByteArray(Charset.forName("UTF-8"))
-          write(call, data, result)
-        }
+        val text = call.argument<String>("text")
+        if (text == null) result.success(false)
+        else write(call, text.toByteArray(Charsets.UTF_8), result)
       }
       "printRawText" -> {
         val raw = call.argument<String>("raw")
-        val data = Base64.decode(raw, Base64.DEFAULT)
-        data?.let { write(call, it,  result) }
+        val data = try {
+          raw?.let { Base64.decode(it, Base64.DEFAULT) }
+        } catch (e: IllegalArgumentException) {
+          null
+        }
+        if (data == null) result.error(ERROR_CODE, "Invalid base64 data", null)
+        else write(call, data, result)
       }
       "write" -> {
         val data = call.argument<ByteArray>("data")
-        if(data != null) write(call, data,  result) else result.success(false)
+        if (data != null) write(call, data, result) else result.success(false)
       }
       "checkDeviceConn" -> {
-        val device = MethodCallParser.parseDevice(call)
-        if (device != null) {
-          val usbDevice = device.usbDevice
-          val deviceId = device.deviceId
-          if (!usbConnCache.containsKey(deviceId)) {
-            usbConnCache[deviceId] = UsbConn(usbDevice)
-          }
-          result.success(usbConnCache[deviceId]!!.isConn)
-        } else {
-          result.error(ERROR_CODE, ERROR_USB, null)
-        }
+        result.success(usbConnCache[MethodCallParser.parseDeviceId(call)]?.isConn == true)
       }
-      "connect" -> {
-        val device = MethodCallParser.parseDevice(call)
-        if (device != null) {
-          val usbDevice = device.usbDevice
-          val deviceId = device.deviceId
-          if (!usbConnCache.containsKey(deviceId)) {
-            usbConnCache[deviceId] = UsbConn(usbDevice)
-          }
-          try {
-            val connected = usbConnCache[deviceId]!!.connect()
-            result.success(connected)
-          } catch (e: Exception) {
-            result.error(ERROR_CODE, e.message ?: "Connection failed", null)
-          }
-        } else {
-          result.error(ERROR_CODE, ERROR_USB, null)
-        }
+      "connect" -> launchReply(result, "Connection failed") {
+        val conn = obtainConn(call)
+        withContext(Dispatchers.IO) { conn.connect() }
       }
       "disconnect" -> {
-        val deviceId = MethodCallParser.parseDeviceId(call)
-        if (usbConnCache.containsKey(deviceId)) {
-          usbConnCache[deviceId]!!.disconnect()
-          usbConnCache.remove(deviceId)
-          result.success(true)
-        } else {
-          result.error(ERROR_CODE, ERROR_USB, null)
+        // Idempotent: closing something that isn't open is not an error.
+        usbConnCache.remove(MethodCallParser.parseDeviceId(call))?.let { conn ->
+          pluginScope.launch(Dispatchers.IO) { conn.disconnect() }
         }
+        result.success(true)
       }
       "checkDevicePermission" -> {
         val device = MethodCallParser.parseDevice(call)
-        if (device != null) {
-          result.success(UsbDeviceHelper.instance.hasPermission(device.usbDevice))
-        } else {
-          result.error(ERROR_CODE, ERROR_USB, null)
-        }
+        if (device != null) result.success(UsbDeviceHelper.instance.hasPermission(device.usbDevice))
+        else result.error(ERROR_CODE, ERROR_USB, null)
       }
       "requestDevicePermission" -> {
         val device = MethodCallParser.parseDevice(call)
-        if (device != null) {
-          UsbDeviceHelper.instance.requestPermission(device.usbDevice)
-          result.success(true)
-        } else {
-          result.error(ERROR_CODE, ERROR_USB, null)
+        if (device != null) launchReply(result, ERROR_PERMISSION) {
+          UsbDeviceHelper.instance.requestPermissionAndWait(device.usbDevice)
+        } else result.error(ERROR_CODE, ERROR_USB, null)
+      }
+      "queryStatus" -> {
+        val query = call.argument<ByteArray>("data") ?: ByteArray(0)
+        val timeout = (call.argument<Int>("timeoutMs") ?: 1000).coerceIn(1, 30000)
+        pluginScope.launch {
+          // Never throws to Dart: unsupported / no reply / no device -> null.
+          val reply = try {
+            val conn = obtainConn(call)
+            withContext(Dispatchers.IO) { conn.query(query, timeout) }
+          } catch (e: Exception) {
+            null
+          }
+          result.success(reply)
         }
       }
       "removeUsbConnCache" -> {
-        val deviceId = MethodCallParser.parseDeviceId(call)
-        removeConnCacheWithKey(deviceId)
+        removeConnCacheWithKey(MethodCallParser.parseDeviceId(call))
         result.success(true)
       }
-    }
-  }
-  
-  private fun write(call: MethodCall, bytes: ByteArray, result: Result) {
-    val usbConn = fetchUsbConn(call)
-    if (usbConn != null) {
-      pluginScope.launch {
-        try {
-          withContext(Dispatchers.IO) {
-            usbConn.writeBytes(bytes)
-          }
-          result.success(true)
-        } catch (e: Exception) {
-          result.error(ERROR_CODE, e.message ?: "Write failed", null)
-        }
-      }
-    } else {
-      result.error(ERROR_CODE, ERROR_USB, null)
+      else -> result.notImplemented()
     }
   }
 
-  private fun fetchUsbConn(call: MethodCall): UsbConn? {
-    val deviceId = MethodCallParser.parseDeviceId(call)
-    if (!usbConnCache.containsKey(deviceId)) {
-      val device = MethodCallParser.parseDevice(call)
-      if (device != null) {
-        usbConnCache[deviceId] = UsbConn(device.usbDevice)
+  private fun <T> launchReply(result: Result, fallback: String, block: suspend () -> T) {
+    pluginScope.launch {
+      try {
+        result.success(block())
+      } catch (e: Exception) {
+        result.error(ERROR_CODE, e.message ?: fallback, null)
       }
     }
-    return usbConnCache[deviceId]
+  }
+
+  /**
+   * Cached connection for the call's vendorId/productId. Asks for permission
+   * (and waits for the user) when the device has none yet. Throws if the device
+   * is absent or permission is refused. Must run on Main.
+   */
+  private suspend fun obtainConn(call: MethodCall): UsbConn {
+    val key = MethodCallParser.parseDeviceId(call)
+    val cached = usbConnCache[key]
+    if (cached != null && cached.isConn) return cached
+    val device = MethodCallParser.parseDevice(call)?.usbDevice ?: throw Exception(ERROR_USB)
+    if (!UsbDeviceHelper.instance.requestPermissionAndWait(device)) throw Exception(ERROR_PERMISSION)
+    // Reuse the cached conn only if it still wraps the same attached device.
+    if (cached != null && cached.device.deviceName == device.deviceName) return cached
+    cached?.let { old -> withContext(Dispatchers.IO) { old.disconnect() } }
+    val fresh = UsbConn(device)
+    usbConnCache[key] = fresh
+    return fresh
+  }
+
+  private fun write(call: MethodCall, bytes: ByteArray, result: Result) {
+    launchReply(result, "Write failed") {
+      val conn = obtainConn(call)
+      withContext(Dispatchers.IO) { conn.writeBytes(bytes) }
+      true
+    }
   }
 
   private fun removeConnCacheWithKey(key: String) {
-    val removeCaches = arrayListOf<String>()
-    usbConnCache.keys.forEach {
-      if (it.contains(key)) {
-        removeCaches.add(it)
-      }
-    }
-    if (removeCaches.isNotEmpty()) {
-      removeCaches.forEach {
-        usbConnCache.remove(it)
+    usbConnCache.keys.filter { it == key }.forEach { k ->
+      usbConnCache.remove(k)?.let { conn ->
+        pluginScope.launch(Dispatchers.IO) { conn.disconnect() }
       }
     }
   }
 
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-    pluginScope.cancel()
     channel.setMethodCallHandler(null)
     eventChannel.setStreamHandler(null)
+    MessageSender.eventSink = null
     UsbDeviceHelper.instance.unRegisterUsbReceiver(binding.applicationContext)
+    val conns = usbConnCache.values.toList()
+    usbConnCache.clear()
+    conns.forEach { try { it.disconnect() } catch (_: Exception) {} }
+    pluginScope.cancel()
   }
 
   override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -235,6 +204,6 @@ class DragoUsbPrinterPlugin : FlutterPlugin, MethodCallHandler, EventChannel.Str
   }
 
   override fun onCancel(arguments: Any?) {
-    //暂无处理
+    MessageSender.eventSink = null
   }
 }

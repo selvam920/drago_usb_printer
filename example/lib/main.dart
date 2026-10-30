@@ -1,8 +1,14 @@
-import 'dart:convert';
 import 'dart:async';
+import 'dart:io';
+
 import 'package:drago_usb_printer/drago_usb_printer.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
+import 'package:material_ui/material_ui.dart';
+
+import 'jobs.dart';
+import 'label_tab.dart';
+import 'printers_section.dart';
+import 'receipt_tab.dart';
 
 void main() => runApp(const MyApp());
 
@@ -14,11 +20,7 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Drago USB Printer',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
-        useMaterial3: true,
-        brightness: Brightness.light,
-      ),
+      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       darkTheme: ThemeData(
         colorSchemeSeed: Colors.indigo,
         useMaterial3: true,
@@ -29,6 +31,8 @@ class MyApp extends StatelessWidget {
   }
 }
 
+enum UseAs { receipt, label, both }
+
 class PrinterHomePage extends StatefulWidget {
   const PrinterHomePage({super.key});
 
@@ -36,385 +40,319 @@ class PrinterHomePage extends StatefulWidget {
   State<PrinterHomePage> createState() => _PrinterHomePageState();
 }
 
-class _PrinterHomePageState extends State<PrinterHomePage> {
+class _PrinterHomePageState extends State<PrinterHomePage>
+    with SingleTickerProviderStateMixin {
   final DragoUsbPrinter _printer = DragoUsbPrinter();
-  final TextEditingController _textController = TextEditingController(
-    text: 'Hello from Drago USB Printer!',
-  );
+  late final TabController _tabs = TabController(length: 2, vsync: this);
 
   List<Map<String, dynamic>> _devices = [];
-  Map<String, dynamic>? _selectedDevice;
-  bool _isConnected = false;
-  bool _isLoading = false;
-  bool _isPrinting = false;
-  String? _statusMessage;
+  Map<String, dynamic>? _selected;
+  bool _connected = false;
+  bool _loading = false;
+  bool _busy = false;
+  String _result = 'Ready';
+  bool _resultError = false;
+  UseAs _useAs = UseAs.both;
+  LabelLang _labelLang = LabelLang.tspl;
+
+  static bool get _isWindows => !kIsWeb && Platform.isWindows;
 
   @override
   void initState() {
     super.initState();
-    _scanDevices();
+    _tabs.addListener(() => _set(() {}));
+    _scan();
   }
 
   @override
   void dispose() {
-    _textController.dispose();
-    if (_isConnected) _printer.close();
+    _tabs.dispose();
+    if (_connected) _printer.close();
     super.dispose();
   }
 
-  // ---------------------------------------------------------------------------
-  // Actions
-  // ---------------------------------------------------------------------------
+  /// setState that is a no-op once the page is gone (awaits can outlive it).
+  void _set(VoidCallback fn) {
+    if (mounted) setState(fn);
+  }
 
-  Future<void> _scanDevices() async {
-    setState(() {
-      _isLoading = true;
-      _statusMessage = 'Scanning for USB printers…';
-    });
+  void _report(String msg, {bool error = false}) => _set(() {
+        _result = msg;
+        _resultError = error;
+      });
+
+  Future<void> _scan() async {
+    _set(() => _loading = true);
     try {
       final results = await DragoUsbPrinter.getUSBDeviceList();
-      setState(() {
+      _set(() {
         _devices = results;
-        _statusMessage = results.isEmpty
-            ? 'No USB printers found. Connect a printer and tap Scan.'
-            : '${results.length} printer(s) found';
-        // Clear selection if the previously-selected device is gone
-        if (_selectedDevice != null &&
-            !results.any((d) =>
-                d['vendorId'] == _selectedDevice!['vendorId'] &&
-                d['productId'] == _selectedDevice!['productId'])) {
-          _selectedDevice = null;
-          _isConnected = false;
+        if (_selected != null &&
+            !results.any((d) => deviceKey(d) == deviceKey(_selected!))) {
+          _selected = null;
+          _connected = false;
         }
       });
+      _report(results.isEmpty
+          ? 'No printers found'
+          : '${results.length} printer(s) found');
     } catch (e) {
-      _showStatus('Scan failed: $e', isError: true);
+      _report('Scan failed: $e', error: true);
     } finally {
-      setState(() => _isLoading = false);
+      _set(() => _loading = false);
     }
   }
 
-  Future<void> _connectToDevice(Map<String, dynamic> device) async {
-    final vendorId = int.parse(device['vendorId']);
-    final productId = int.parse(device['productId']);
-
-    setState(() {
-      _isLoading = true;
-      _statusMessage = 'Connecting…';
-    });
+  Future<void> _connect(Map<String, dynamic> device) async {
+    _set(() => _loading = true);
     try {
-      final connected = await _printer.connect(vendorId, productId) ?? false;
-      setState(() {
-        _isConnected = connected;
-        _selectedDevice = connected ? device : null;
+      final name = device['printerName'] as String?;
+      final bool ok;
+      if (name != null) {
+        // Windows: an installed printer, opened by name (RAW spooler jobs).
+        ok = await _printer.connectPrinter(name);
+      } else {
+        final vid = int.tryParse('${device['vendorId']}');
+        final pid = int.tryParse('${device['productId']}');
+        if (vid == null || pid == null) {
+          _report('Invalid device ids', error: true);
+          return;
+        }
+        ok = await _printer.connect(vid, pid) ?? false;
+      }
+      _set(() {
+        _connected = ok;
+        _selected = ok ? device : null;
+        if (ok) _labelLang = _defaultLang(device);
       });
-      _showStatus(
-        connected ? 'Connected to ${_deviceLabel(device)}' : 'Connection failed',
-        isError: !connected,
-      );
+      _report(
+          ok
+              ? 'Connected to ${deviceLabel(device)}'
+              : 'Could not connect to ${deviceLabel(device)}',
+          error: !ok);
     } catch (e) {
-      _showStatus('Connection error: $e', isError: true);
+      _report('Connection error: $e', error: true);
     } finally {
-      setState(() => _isLoading = false);
+      _set(() => _loading = false);
     }
+  }
+
+  /// LD0801 / DeTong DP27 speak ESC/POS raster only (no TSPL).
+  LabelLang _defaultLang(Map<String, dynamic> d) {
+    final name = '${d['printerName'] ?? ''}'.toUpperCase();
+    return _isWindows && (name.contains('LD0801') || name.contains('DP27'))
+        ? LabelLang.escpos
+        : LabelLang.tspl;
   }
 
   Future<void> _disconnect() async {
-    setState(() => _isLoading = true);
+    _set(() => _loading = true);
     try {
       await _printer.close();
-      setState(() {
-        _isConnected = false;
-        _selectedDevice = null;
+      _set(() {
+        _connected = false;
+        _selected = null;
       });
-      _showStatus('Disconnected');
+      _report('Disconnected');
     } catch (e) {
-      _showStatus('Disconnect error: $e', isError: true);
+      _report('Disconnect error: $e', error: true);
     } finally {
-      setState(() => _isLoading = false);
+      _set(() => _loading = false);
     }
   }
 
-  Future<void> _printText() async {
-    final text = _textController.text.trim();
-    if (text.isEmpty) {
-      _showStatus('Enter some text first', isError: true);
+  Future<void> _run(String name, Uint8List Function() build) async {
+    if (!_connected) {
+      _report('Connect to a printer first', error: true);
       return;
     }
-    await _doPrint(() => _printer.printText('$text\n'));
-  }
-
-  Future<void> _printRawBytes() async {
-    final text = _textController.text.trim();
-    if (text.isEmpty) {
-      _showStatus('Enter some text first', isError: true);
-      return;
-    }
-    final bytes = Uint8List.fromList(utf8.encode('$text\n'));
-    await _doPrint(() => _printer.write(bytes));
-  }
-
-  Future<void> _printTestReceipt() async {
-    // ESC/POS initialize + simple receipt
-    final List<int> escPos = [
-      0x1B, 0x40, // ESC @ — Initialize printer
-      0x1B, 0x61, 0x01, // ESC a 1 — Center align
-      0x1B, 0x45, 0x01, // ESC E 1 — Bold ON
-      ...utf8.encode('DRAGO USB PRINTER\n'),
-      0x1B, 0x45, 0x00, // ESC E 0 — Bold OFF
-      ...utf8.encode('------------------------------\n'),
-      0x1B, 0x61, 0x00, // ESC a 0 — Left align
-      ...utf8.encode('Item              Qty   Price\n'),
-      ...utf8.encode('Widget A            2   \$4.00\n'),
-      ...utf8.encode('Widget B            1   \$7.50\n'),
-      ...utf8.encode('Widget C            3   \$2.25\n'),
-      ...utf8.encode('------------------------------\n'),
-      0x1B, 0x61, 0x02, // ESC a 2 — Right align
-      0x1B, 0x45, 0x01,
-      ...utf8.encode('TOTAL: \$22.25\n'),
-      0x1B, 0x45, 0x00,
-      0x1B, 0x61, 0x01, // Center
-      ...utf8.encode('\nThank you!\n\n\n'),
-      0x1D, 0x56, 0x00, // GS V 0 — Full cut
-    ];
-    await _doPrint(() => _printer.write(Uint8List.fromList(escPos)));
-  }
-
-  Future<void> _doPrint(Future<bool?> Function() printFn) async {
-    if (!_isConnected) {
-      _showStatus('Connect to a printer first', isError: true);
-      return;
-    }
-    setState(() => _isPrinting = true);
+    _set(() {
+      _busy = true;
+      _result = 'Printing $name...';
+      _resultError = false;
+    });
     try {
-      final ok = await printFn() ?? false;
-      _showStatus(ok ? 'Print successful' : 'Print returned false', isError: !ok);
+      final bytes = build();
+      final ok = await _printer.write(bytes) ?? false;
+      _report(ok ? '$name sent (${bytes.length} bytes)' : '$name: write failed',
+          error: !ok);
     } catch (e) {
-      _showStatus('Print error: $e', isError: true);
+      _report('$name: ${e is FormatException ? e.message : e}', error: true);
     } finally {
-      setState(() => _isPrinting = false);
+      _set(() => _busy = false);
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
-
-  String _deviceLabel(Map<String, dynamic> d) {
-    final product = d['productName'] ?? '';
-    final manufacturer = d['manufacturer'] ?? '';
-    if (product.toString().isNotEmpty) return '$manufacturer $product'.trim();
-    return 'Printer (${d['vendorId']}:${d['productId']})';
+  /// Which language the status query uses: the label language on the label
+  /// tab, ESC/POS otherwise.
+  LabelLang get _statusLang {
+    final onLabel =
+        _useAs == UseAs.label || (_useAs == UseAs.both && _tabs.index == 1);
+    return onLabel ? _labelLang : LabelLang.escpos;
   }
 
-  void _showStatus(String msg, {bool isError = false}) {
-    setState(() => _statusMessage = msg);
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: isError ? Colors.red.shade700 : null,
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 3),
-      ),
-    );
+  Future<void> _status() async {
+    if (!_connected) {
+      _report('Connect to a printer first', error: true);
+      return;
+    }
+    final lang = _statusLang;
+    _set(() => _busy = true);
+    try {
+      final reply = await _printer.queryStatus(statusQuery(lang),
+          timeout: const Duration(milliseconds: 1500));
+      if (reply == null || reply.isEmpty) {
+        _report(_isWindows
+            ? 'Status: no reply (not supported on Windows)'
+            : 'Status: no reply');
+      } else {
+        _report('Status: ${describeStatus(lang, reply)}');
+      }
+    } catch (e) {
+      _report('Status error: $e', error: true);
+    } finally {
+      _set(() => _busy = false);
+    }
   }
 
   // ---------------------------------------------------------------------------
   // UI
   // ---------------------------------------------------------------------------
 
+  Widget _printers() => PrintersSection(
+        devices: _devices,
+        selected: _selected,
+        connected: _connected,
+        loading: _loading,
+        onRefresh: _scan,
+        onConnect: _connect,
+        onDisconnect: _disconnect,
+      );
+
+  Widget _useAsPicker() => Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+        child: Row(children: [
+          const Text('Use as'),
+          const SizedBox(width: 12),
+          Expanded(
+            child: SegmentedButton<UseAs>(
+              segments: const [
+                ButtonSegment(
+                    value: UseAs.receipt,
+                    icon: Icon(Icons.receipt_long),
+                    label: Text('Receipt')),
+                ButtonSegment(
+                    value: UseAs.label,
+                    icon: Icon(Icons.label_outline),
+                    label: Text('Label')),
+                ButtonSegment(value: UseAs.both, label: Text('Both')),
+              ],
+              selected: {_useAs},
+              onSelectionChanged: (s) => setState(() => _useAs = s.first),
+            ),
+          ),
+        ]),
+      );
+
+  Widget _jobs() {
+    final on = _connected && !_busy;
+    final receipt = ReceiptTab(enabled: on, run: _run);
+    final label = LabelTab(
+      enabled: on,
+      run: _run,
+      lang: _labelLang,
+      onLang: (l) => setState(() => _labelLang = l),
+    );
+    final Widget body = switch (_useAs) {
+      UseAs.receipt => receipt,
+      UseAs.label => label,
+      UseAs.both => Column(children: [
+          TabBar(controller: _tabs, tabs: const [
+            Tab(icon: Icon(Icons.receipt_long), text: 'Receipt'),
+            Tab(icon: Icon(Icons.label_outline), text: 'Label'),
+          ]),
+          Expanded(
+            child: TabBarView(controller: _tabs, children: [receipt, label]),
+          ),
+        ]),
+    };
+    return Column(children: [_useAsPicker(), Expanded(child: body)]);
+  }
+
+  Widget _resultBar() {
+    final cs = Theme.of(context).colorScheme;
+    return Material(
+      color: _resultError ? cs.errorContainer : cs.surfaceContainerHigh,
+      child: SafeArea(
+        top: false,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (_busy) const LinearProgressIndicator(minHeight: 3),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Row(children: [
+              Icon(
+                _resultError ? Icons.error_outline : Icons.info_outline,
+                color: _resultError ? cs.onErrorContainer : cs.onSurfaceVariant,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  _result,
+                  style: TextStyle(
+                      color: _resultError
+                          ? cs.onErrorContainer
+                          : cs.onSurfaceVariant),
+                ),
+              ),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final cs = theme.colorScheme;
-
+    final wide = MediaQuery.sizeOf(context).width >= 900;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('USB Printer Demo'),
-        centerTitle: true,
+        title: Text(_connected && _selected != null
+            ? deviceLabel(_selected!)
+            : 'USB Printer Demo'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Scan for printers',
-            onPressed: _isLoading ? null : _scanDevices,
+          TextButton.icon(
+            onPressed: _connected && !_busy ? _status : null,
+            icon: const Icon(Icons.monitor_heart_outlined),
+            label: Text(
+                'Status (${_statusLang == LabelLang.tspl ? 'TSPL' : 'ESC/POS'})'),
           ),
+          const SizedBox(width: 8),
         ],
       ),
+      bottomNavigationBar: _resultBar(),
       body: SafeArea(
-        child: _isLoading && _devices.isEmpty
-            ? const Center(child: CircularProgressIndicator())
-            : ListView(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                children: [
-                  // ---- Status card ----
-                  if (_statusMessage != null) ...[
-                    Card(
-                      color: cs.secondaryContainer,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 12),
-                        child: Row(
-                          children: [
-                            Icon(
-                              _isConnected
-                                  ? Icons.check_circle_outline
-                                  : Icons.info_outline,
-                              color: cs.onSecondaryContainer,
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(
-                                _statusMessage!,
-                                style: TextStyle(
-                                    color: cs.onSecondaryContainer),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                  ],
-
-                  // ---- Device list ----
-                  Text('Printers',
-                      style: theme.textTheme.titleMedium
-                          ?.copyWith(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  if (_devices.isEmpty)
-                    Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Column(
-                          children: [
-                            Icon(Icons.usb_off,
-                                size: 48, color: cs.outline),
-                            const SizedBox(height: 12),
-                            Text(
-                              'No printers detected',
-                              style: theme.textTheme.bodyLarge
-                                  ?.copyWith(color: cs.outline),
-                            ),
-                            const SizedBox(height: 8),
-                            FilledButton.tonalIcon(
-                              onPressed: _scanDevices,
-                              icon: const Icon(Icons.refresh),
-                              label: const Text('Scan Again'),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ..._devices.map((device) {
-                    final isSelected = _selectedDevice != null &&
-                        _selectedDevice!['vendorId'] == device['vendorId'] &&
-                        _selectedDevice!['productId'] == device['productId'];
-                    return Card(
-                      elevation: isSelected ? 3 : 1,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        side: isSelected
-                            ? BorderSide(color: cs.primary, width: 2)
-                            : BorderSide.none,
-                      ),
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 8),
-                        leading: CircleAvatar(
-                          backgroundColor:
-                              isSelected ? cs.primary : cs.surfaceContainerHighest,
-                          child: Icon(
-                            Icons.print,
-                            color: isSelected
-                                ? cs.onPrimary
-                                : cs.onSurfaceVariant,
-                          ),
-                        ),
-                        title: Text(
-                          _deviceLabel(device),
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Text(
-                          'VID: ${device['vendorId']}  PID: ${device['productId']}',
-                        ),
-                        trailing: isSelected && _isConnected
-                            ? FilledButton.tonal(
-                                onPressed: _isLoading ? null : _disconnect,
-                                child: const Text('Disconnect'),
-                              )
-                            : FilledButton(
-                                onPressed: _isLoading
-                                    ? null
-                                    : () => _connectToDevice(device),
-                                child: const Text('Connect'),
-                              ),
-                      ),
-                    );
-                  }),
-
-                  const SizedBox(height: 24),
-
-                  // ---- Print section ----
-                  Text('Print',
-                      style: theme.textTheme.titleMedium
-                          ?.copyWith(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  Card(
+        child: wide
+            ? Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                SizedBox(
+                  width: 380,
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(12),
+                    child: _printers(),
+                  ),
+                ),
+                const VerticalDivider(width: 1),
+                Expanded(child: _jobs()),
+              ])
+            : NestedScrollView(
+                headerSliverBuilder: (context, _) => [
+                  SliverToBoxAdapter(
                     child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          TextField(
-                            controller: _textController,
-                            decoration: InputDecoration(
-                              labelText: 'Text to print',
-                              border: const OutlineInputBorder(),
-                              suffixIcon: IconButton(
-                                icon: const Icon(Icons.clear),
-                                onPressed: () => _textController.clear(),
-                              ),
-                            ),
-                            maxLines: 3,
-                            minLines: 1,
-                          ),
-                          const SizedBox(height: 16),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              FilledButton.icon(
-                                onPressed:
-                                    _isConnected && !_isPrinting ? _printText : null,
-                                icon: const Icon(Icons.text_fields),
-                                label: const Text('Print Text'),
-                              ),
-                              FilledButton.tonalIcon(
-                                onPressed:
-                                    _isConnected && !_isPrinting ? _printRawBytes : null,
-                                icon: const Icon(Icons.code),
-                                label: const Text('Write Raw'),
-                              ),
-                              OutlinedButton.icon(
-                                onPressed: _isConnected && !_isPrinting
-                                    ? _printTestReceipt
-                                    : null,
-                                icon: const Icon(Icons.receipt_long),
-                                label: const Text('Test Receipt'),
-                              ),
-                            ],
-                          ),
-                          if (_isPrinting) ...[
-                            const SizedBox(height: 16),
-                            const LinearProgressIndicator(),
-                          ],
-                        ],
-                      ),
+                      padding: const EdgeInsets.all(12),
+                      child: _printers(),
                     ),
                   ),
                 ],
+                body: _jobs(),
               ),
       ),
     );
