@@ -89,8 +89,8 @@ class DragoUsbPrinter {
   Future<bool?> close() async {
     if (_isWindows) return true; // each Windows job opens/closes itself
     Map<String, dynamic> params = {
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('disconnect', params);
     return result;
@@ -104,8 +104,8 @@ class DragoUsbPrinter {
     }
     Map<String, dynamic> params = {
       "text": text,
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('printText', params);
     return result;
@@ -117,8 +117,8 @@ class DragoUsbPrinter {
     if (_isWindows) return _windowsWrite(base64.decode(text));
     Map<String, dynamic> params = {
       "raw": text,
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('printRawText', params);
     return result;
@@ -130,8 +130,8 @@ class DragoUsbPrinter {
     if (_isWindows) return _windowsWrite(data);
     Map<String, dynamic> params = {
       "data": data,
-      "vendorId": vendorId,
-      "productId": productId
+      "vendorId": vid ?? vendorId,
+      "productId": pid ?? productId
     };
     final bool? result = await _channel.invokeMethod('write', params);
     return result;
