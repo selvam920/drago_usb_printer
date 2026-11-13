@@ -45,13 +45,37 @@ class UsbConn(private val mUsbDevice: UsbDevice) {
                 c == UsbConstants.USB_CLASS_VIDEO ||
                 c == UsbConstants.USB_CLASS_WIRELESS_CONTROLLER
 
-        /** Printer-class interface with bulk OUT first, else any non-excluded interface with bulk OUT. */
+        /**
+         * A function no printer has: Wi-Fi / Bluetooth (wireless controller),
+         * audio or video. A composite device carrying one is that kind of
+         * device -- a Realtek Wi-Fi + Bluetooth adapter has seven Bluetooth
+         * interfaces and one vendor-specific (0xFF) Wi-Fi interface with a
+         * bulk OUT, which passed as a printer and made every list / connect
+         * ask "Allow ... to access 802.11ac NIC?".
+         */
+        private fun isNonPrinterFunction(c: Int): Boolean =
+            c == UsbConstants.USB_CLASS_WIRELESS_CONTROLLER ||
+                c == UsbConstants.USB_CLASS_AUDIO ||
+                c == UsbConstants.USB_CLASS_VIDEO
+
+        /**
+         * Printer-class interface with bulk OUT first, else (a thermal printer
+         * reporting a vendor-specific class) any non-excluded interface with
+         * bulk OUT -- but never on a device that also carries a wireless,
+         * audio or video function.
+         */
         fun pickInterface(device: UsbDevice): UsbInterface? {
             val all = (0 until device.interfaceCount).map { device.getInterface(it) }
-            return all.firstOrNull {
+            all.firstOrNull {
                 it.interfaceClass == UsbConstants.USB_CLASS_PRINTER &&
                     endpoint(it, UsbConstants.USB_DIR_OUT) != null
-            } ?: all.firstOrNull {
+            }?.let { return it }
+            if (isNonPrinterFunction(device.deviceClass) ||
+                all.any { isNonPrinterFunction(it.interfaceClass) }
+            ) {
+                return null
+            }
+            return all.firstOrNull {
                 !isExcludedClass(it.interfaceClass) && endpoint(it, UsbConstants.USB_DIR_OUT) != null
             }
         }

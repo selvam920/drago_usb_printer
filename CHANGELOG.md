@@ -67,4 +67,5 @@
 * Every method replies exactly once (`printText` null, bad base64, unknown methods); `disconnect` when not connected returns true.
 * Receiver registered once and unregistered safely.
 * Windows: `getUSBDeviceList` lists installed printers (default first, with `printerName`, `port`, `isDefault`, `isOffline`); `connectPrinter(name)` selects one and `write` / `printText` / `printRawText` send RAW spooler jobs. Pure Dart (win32), no native code.
-* New: `queryStatus(query, {timeout})` returns the printer's status reply (null when unsupported).
+* New: `queryStatus(query, {timeout})` returns the printer's status reply (null when unsupported).## 0.1.8
+* Android: a device with a Wi-Fi / Bluetooth, audio or video function is never listed as a printer, even when one of its interfaces is vendor-class (0xFF) with a bulk OUT. A TV's Realtek Wi-Fi + Bluetooth adapter was listed and asked for USB permission ("Allow ... to access 802.11ac NIC?"). Printer-class (7) interfaces are still accepted.
